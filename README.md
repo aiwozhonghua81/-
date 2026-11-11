@@ -1,3 +1,639 @@
+<!-- 中文说明开始 -->
+
+# 🇨🇳 中文详细说明 · ZakoAI Proxy（ZakoProxyCLI）
+
+> **本节是给中文读者写的通俗版说明，面向第一次接触「API 中转」的朋友。**
+> 下方「↓ 上游 README 原文开始 ↓」以下是上游 [mizaawa/ZakoProxyCLI](https://github.com/mizaawa/ZakoProxyCLI) 的原文，**一字未删**。
+> 英文版见 [`README.en.md`](README.en.md)，API 契约见 [`API_CONTRACT.md`](API_CONTRACT.md)，安全说明见 [`SECURITY.md`](SECURITY.md)。
+
+---
+
+## ⚠️ 先看这一条：合规提醒
+
+上游 README 开头就是免责声明：
+
+> **严禁将本项目用于任何违法违纪活动。** 仅供合法、合规的学习、研究和在你本人有权操作的环境里使用。
+
+- ✅ 可以：自己搭、给自己用、做技术研究
+- ❌ 不可以：转卖、共享、用于任何违法违规用途
+- 上游密钥、客户端密钥的归属和合法性由使用者自己负责
+
+许可证是 **MIT**（最宽松的开源协议之一，可自由商用闭源）。
+
+---
+
+## 一、这是什么（一句话说清）
+
+**ZakoAI Proxy 是一个「AI API 中转站」的自托管服务端 —— 你把自己的大模型 API Key 放进去，它帮你统一管理、负载均衡、加监控，然后对外提供一个统一的地址让你的客户端连。**
+
+### 先搞懂三个名词
+
+| 名词 | 大白话解释 |
+| --- | --- |
+| **API Key** | 你在 OpenAI / Anthropic / 嘉立创等平台申请的一串密钥，调用模型要用它 |
+| **中转站 / 反代** | 一个站在你和上游模型之间的服务器。你的客户端连它，它再连上游，**中间帮你做调度、监控、故障切换** |
+| **Responses / Chat Completions / Anthropic Messages** | 三种不同的「和模型说话的格式」。OpenAI 风格、OpenAI 老格式、Anthropic 风格 |
+
+### 打个比方
+
+```
+你的客户端（Cline / Claude Code / 你的脚本）
+        │
+        │  POST /v1/responses
+        │  Authorization: Bearer <你的中转密钥>
+        ▼
+┌──────────────────────────────────────────┐
+│  ZakoAI Proxy（这个项目）                  │
+│  ├─ 分组管理：这次请求归哪个分组            │
+│  ├─ 策略注入：给特定模型追加专用提示词      │
+│  ├─ 账号调度：按优先级挑可用账号            │
+│  ├─ 故障切换：账号挂了自动换下一个          │
+│  ├─ 限流：RPM / 并发保护                    │
+│  └─ 统计：token 用量、命中率、耗时          │
+└──────────────────────────────────────────┘
+        │            │            │
+        ▼            ▼            ▼
+   上游账号A      上游账号B      上游账号C
+   (key1)         (key2)         (key3)
+```
+
+### 它具体解决什么问题
+
+| 痛点 | ZakoAI Proxy 的解法 |
+| --- | --- |
+| **有多个上游账号/key，怕某个挂了** | 账号池 + 自动故障切换（401/403/408/429/5xx 都能切） |
+| **一个 key 被限流** | 按优先级轮换账号，各自独立的 RPM 和并发限制 |
+| **不同项目想用不同模型/不同分组** | 分组（Group）机制，每个分组绑定一组账号和策略 |
+| **想在客户端填一个地址，而不是十个** | 统一 `/v1` 入口，密钥分组管理 |
+| **不知道钱花哪了** | 仪表盘：token 用量、缓存命中率、RPM/TPM、成功率、平均耗时 |
+| **想看每次请求出了啥错** | 独立调用日志，保留最近 7 天，可分页、可 JSON 导出 |
+
+---
+
+## 二、适合谁用 / 能解决什么问题
+
+### ✅ 适合你，如果你是
+
+| 你是 | 你会得到什么 |
+| --- | --- |
+| **个人开发者，有好几个模型 API Key** | 统一入口 + 自动故障切换，一个 Key 挂了不影响干活 |
+| **团队负责人，想看谁用了多少** | 每个客户端一个命名密钥，用量分开统计 |
+| **重度使用 AI CLI 工具的人** | 生成的密钥直接填进 Cline / Claude Code / Cursor，base URL 改成你的站点 |
+| **想自己掌控数据流向的人** | **自托管**。数据全在你自己机器上的 SQLite 里，不经过任何第三方 |
+| **需要「特定模型用特定提示词」的人** | 36 个内置策略，按精确模型 ID 匹配，自动注入到请求里 |
+
+### 🎯 核心功能一览
+
+| 功能 | 说明 |
+| --- | --- |
+| **账号管理** | 添加上游端点 + API Key，勾选支持的协议，拉取并勾选实际可用模型，设优先级、RPM、并发、账号级代理 |
+| **模型映射** | 让客户端用别名请求，实际发给上游的是另一个模型名。例：客户端请求 `chat-main` → 实际发 `gpt-6-astra` |
+| **分组管理** | 把账号归到分组，客户端密钥绑定分组。分组还能独立勾选「破甲策略」 |
+| **密钥管理** | 为分组创建命名密钥，可停用/删除，可复制，可看单密钥用量 |
+| **调用日志** | 独立页面，默认保留 7 天，每页 20 条，可跳页、JSON 导出、清空 |
+| **仪表盘统计** | 输入/输出/缓存/未命中 token、缓存命中率、RPM、TPM、总请求、成功率、平均耗时、每日图表、Cyber 标记次数 |
+| **系统设置** | 安全入口路径、最大重试数、失败阈值、冷却时间、请求超时、统计保留天数、Turnstile 人机校验 |
+| **网页更新** | v0.3.0 起可在页面里检查 GitHub 最新正式 Release 并一键更新（需要管理员密码确认） |
+| **安全入口** | 把控制台从 `/` 移到 `/<自定义路径>`，`/health` 和 `/v1/*` 不受影响 |
+| **加密存储** | 上游密钥和客户端密钥用 `master.key` + **AES-256-GCM** 加密；管理员密码用 **Argon2** 摘要 |
+| **Turnstile 人机校验** | 登录时启用 Cloudflare Turnstile，密钥加密保存且不通过 API 返回 |
+
+---
+
+## 三、核心功能深挖
+
+### 3.1 三种协议，原样透传
+
+代理**不做协议转换**。你的客户端用什么格式请求，就用什么格式转发。
+
+| 端点 | 对应协议 | 上游路由 |
+| --- | --- | --- |
+| `GET /v1/models` | — | 返回当前分组账号已勾选的实际模型 + 有效映射的请求模型名 |
+| `POST /v1/responses` | `responses` | 上游 `/v1/responses` |
+| `POST /v1/responses/compact` | `compact` | 上游 `/v1/responses/compact`（上下文压缩，实际支持看上游） |
+| `POST /v1/chat/completions` | `chat` | 上游 `/v1/chat/completions` |
+| `POST /v1/messages` | `anthropic` | 上游 `/v1/messages` |
+
+**鉴权方式**：`Authorization: Bearer <key>` 或 `x-api-key: <key>` 都可以。
+
+**注意**：代理**不补充** Google 等厂商的原生接口。你要用 Gemini 原生接口请直连。
+
+### 3.2 账号调度规则（这部分逻辑很严谨）
+
+**选账号的三个条件必须同时满足**：
+1. 账号属于请求密钥所在的**分组**
+2. 账号**启用**了请求对应的**协议**
+3. **映射后的实际模型**在账号的 `models` 勾选列表里
+
+**排序规则**：
+- **优先级数字越小越先尝试**（0 最高）
+- 相同优先级按**账号 ID 稳定排序**（保证行为可预测）
+
+**重试规则**：
+- 单个请求最多尝试 **`最大重试数 + 1`** 个**不同**的账号
+- 每次尝试都**从原始客户端请求重新开始**，重新应用当前账号的单跳映射，再按实际模型匹配策略
+- 故障转移到其他账号时**独立计算**，**不继承也不叠加**前一账号的策略
+
+**什么情况会切换账号**（响应开始前）：
+> 连接失败、HTTP 401、403、408、429、HTTP 5xx
+
+**什么情况不切换**：其余 4xx 原样返回（比如 400 参数错误，重试也没用）。
+**流式响应已开始后中断不会重放请求**（因为已经吐出去一部分了）。
+
+**冷却机制**：连续可重试失败达到**失败阈值** → 进入**冷却**，冷却时间结束后重新参与调度。
+
+### 3.3 「破甲策略」是什么
+
+这是这个项目最有特色的功能，也是最需要理解的部分。
+
+**机制**：给特定的模型，在请求发往上游之前，**自动前置一段提示词**。
+
+- **按精确模型 ID 匹配**，不是按系列通配。目录里有 **36 个策略、37 个精确模型 ID**
+- **专用策略优先**：分组里勾选了某个模型的专用策略 → 用它
+- **默认策略兜底**：没匹配到专用策略时，只有 `default_strategy_enabled` 开关**开着**才用默认策略
+- **一次请求最多用一种策略**，专用和默认正文**不拼接**
+- 开关**新建分组和旧版分组默认都是关闭的**
+
+**默认策略**：`profiles/default.md`，正文 **3,844 字节 UTF-8**。它改编自 gpt-6-astra 提示词的任务执行与连续任务机制，去掉了固定模型身份、本机工具环境和强制四文件交付等假设，保留客户端上下文和真实可用工具。
+
+**冷咖啡系列**（Claude/Grok/Gemini/DeepSeek/GLM 共 27 个策略）：保留上游席位正文、工作链和完整路由技能，**单次匹配注入约 64–66 KB 的 UTF-8 文本**。
+
+> ⚠️ **这会占用上下文并增加输入 token。** 上游 README 界面上也明确提示：
+> 「开启后，未勾选模型将采取默认提示词注入尝试进行破甲，如造成无法正常使用现象请关闭此选项」
+
+**寒霜策略**（DeepSeek 4.1 Flash）：4,748 字节，来自 `aimeoa/hanshuang-codex`。
+**Kimi 策略**（4 个逐模型）：单次匹配增加 **13,264 字节** UTF-8 指令。
+
+**策略选择表**（按精确模型 ID）：
+
+| 模型系列 | 精确匹配的模型 ID |
+| --- | --- |
+| **GPT** | `gpt-5.6-sol`、`gpt-6.1-sol`、`gpt-6-astra` |
+| **Claude** | `claude-fable-5`、`claude-fable-5-1`、`claude-haiku-4-5`、`claude-haiku-5-5`、`claude-opus-4-5`、`claude-opus-4-6`、`claude-opus-4-7`、`claude-opus-4-8`、`claude-opus-5`、`claude-opus-5-5`、`claude-sonnet-4-5`、`claude-sonnet-4-6`、`claude-sonnet-5`、`claude-sonnet-5-5` |
+| **Grok** | `grok-4.7` |
+| **Gemini** | `gemini-3-flash`、`gemini-3.1-flash-image`、`gemini-3.1-pro`、`gemini-3.1-pro-preview`、`gemini-3.6-flash`、`gemini-3.7-flash`、`gemini-3.8-flash` |
+| **DeepSeek** | `deepseek-v4-flash`、`deepseek-v4-flash-0731`、`deepseek-v4-pro`、`deepseek-v4-pro-0813`、`deepseek-v4.1-flash` / `deepseek-4.1-flash`（共用原寒霜策略）、`deepseek-flash`（独立寒霜策略） |
+| **GLM** | `glm-5.3` |
+| **Kimi** | `kimi-k3`、`kimi-k2.7`、`kimi-k2.7-code`、`kimi-k2.6` |
+
+> 📌 名单表示**策略选择**，**不承诺上游提供这些模型**。以账号实际可用模型和协议为准。
+
+**效果边界（很重要）**：
+> 「破甲」配置属于可选指令文本，**不保证抢占上游系统指令优先级、改变模型行为或消除拒答**，实际结果取决于上游服务。
+
+### 3.4 模型映射（别名）
+
+```json
+{
+  "models": ["gpt-6-astra"],
+  "model_mappings": { "chat-main": "gpt-6-astra" }
+}
+```
+
+- 客户端请求 `chat-main` → 实际发给上游 `model: "gpt-6-astra"`
+- **映射只执行一次，不递归串联**
+- 未配置映射的请求使用同名模型
+- 映射目标**必须**已在账号的 `models` 里勾选
+- 最多 500 个模型、500 条映射
+- 模型 ID 长度 1–256 字节，不含空白和控制字符
+
+**重要**：策略匹配用的是**映射后的实际模型**，不是别名。所以上面的例子中，`chat-main` 走的是 `gpt-6-astra` 的策略。
+
+### 3.5 账号级代理
+
+每个账号可以单独配一个代理（`socks5://`、`socks5h://`，可带用户名密码）。
+
+- 代理地址**加密保存**，编辑时留空保留原值
+- 响应里只返回 `proxy_display`（脱敏）和 `has_proxy` 标志，**不返回完整 URL**
+- 保存后**四协议、流式请求、模型获取都走这个代理**
+- **代理失败不会自动改为该账号直连**，重试时用下一个账号自己的代理
+- 右侧有测试按钮：走代理请求上游模型接口，显示耗时、HTTP 状态或脱敏错误
+  - HTTP 401/403 = 代理通了，但上游鉴权失败
+- 支持 `socks5://host:port`、`socks5h://host:port`、带用户名密码的链接（特殊字符要百分号编码）
+
+### 3.6 安全入口
+
+把控制台从 `/` 移到 `/<你自定义的路径>`，比如 `/console-8f3a`。
+
+- `/health` 和 `/v1/*` **不受影响**
+- 它是**额外的入口隐藏措施，不代替登录认证**
+- 保存设置后**前端会自动跳转到新路径**
+
+### 3.7 更新机制
+
+**v0.5.0 起**：登录后自动检查新版本，页面可见时每 15 分钟复查；后台标签暂停检查，退出登录停止检查。发现更高正式版本时，页面标题旁显示带圆点的黄色「有新版本」标签。
+
+**v0.3.0 起**：可以在「系统设置 → GitHub 源码更新」里检查 GitHub 最新正式 Release 并执行更新。
+
+**安全设计**：
+- 选择更新后**需再次输入当前管理员密码**
+- 更新器**从官方仓库检出对应标签**，不接受用户提供的任意地址或命令
+- 不允许覆盖已公开的同版本
+
+**失败保护**：
+- 源码构建成功后，更新器先**停止代理并备份完整数据**，再启动新镜像
+- 部署或健康检查失败时**恢复旧版本及同一次数据备份**
+- 更新状态和备份保留在 `update-state` 数据卷
+
+**架构上的安全隔离**：
+- Compose 启动**隔离的 `updater` 服务**，**不对宿主机发布端口**
+- 主程序通过内部 `UPDATER_URL=http://updater:9000/` 及只读 `/control/token` 访问它
+- **Docker socket 只挂载给更新器，不挂载给公开的代理服务**
+- ⚠️ 更新器持有近似宿主机 root 的 Docker 控制能力，**请仅在受控服务器上部署**，不要对外暴露内部接口或共享令牌
+
+---
+
+## 四、怎么快速上手
+
+### 4.1 先决条件
+
+| 需要什么 | 说明 |
+| --- | --- |
+| **Docker Engine / Docker Desktop** | 推荐路径需要 |
+| **Docker Compose v2** | `docker compose` 命令 |
+| Rust **1.99** + Node.js **22** + npm | 只有本地开发才需要（SQLite 在 Rust 构建中自带） |
+
+### 4.2 Docker Compose 部署（最常用）
+
+```sh
+git clone https://github.com/mizaawa/ZakoProxyCLI.git
+cd ZakoProxyCLI
+docker compose pull
+docker compose build --pull
+docker compose up -d --no-build
+docker compose ps
+```
+
+**访问 http://localhost:1990**
+
+**这四行各自干什么**（原文特意解释过）：
+| 命令 | 作用 |
+| --- | --- |
+| `docker compose pull` | 下载已发布镜像 `ghcr.io/mizaawa/zakoai-proxy-cli:latest` |
+| `docker compose build --pull` | 更新 Node、Rust、Debian 基础镜像，并**从当前源码重新编译**项目 |
+| `docker compose up -d --no-build` | 启动服务（`--no-build` 表示用上面拉/编好的，别再构建一遍） |
+| `docker compose ps` | 看服务状态 |
+
+**首次进入会创建管理员账号，密码至少 12 个字符**。项目**没有默认管理员账号或密码**，请先完成初始化再对外开放服务。
+
+### 4.3 端口和 `.env` 配置
+
+Compose 默认**只把宿主机 `127.0.0.1:1990` 映射到容器**（也就是只有本机能访问，很安全）。
+
+需要对外开放时，在**不提交 Git** 的 `.env` 里配：
+
+```dotenv
+ZAKO_BIND_IP=0.0.0.0
+ZAKO_PORT=1990
+TRUST_PROXY=0
+```
+
+> ⚠️ **公网部署请通过可信反向代理提供 HTTPS，后端端口保持私有。**
+> 仅在代理之后设置 `TRUST_PROXY=1`，代理须保留原始 `Host` 并传入 `X-Forwarded-Proto: https`，从而启用会话 Cookie 的 `Secure` 属性。
+> **SSE 代理需关闭响应缓冲，读取超时应大于系统设置中的请求超时。**
+
+### 4.4 日常运维命令
+
+```sh
+docker compose logs --tail=100 -f     # 看日志
+curl --fail http://localhost:1990/health   # 健康检查
+docker compose down                 # 停止（保留数据卷）
+docker compose down -v              # ⚠️ 停止并删除数据卷（管理员、配置、密钥、统计全没了）
+```
+
+### 4.5 客户端接入
+
+**基础地址**：
+- Chat Completions 客户端：当前站点 + `/v1`，启用账号的 `chat` 协议
+- Anthropic 客户端：当前站点（**不加 `/v1`**），选择已启用 `anthropic` 协议的账号模型
+
+**测试请求**：
+
+```sh
+export ZAKO_API_KEY='YOUR_GENERATED_PROXY_KEY'
+
+# 普通请求
+curl http://localhost:1990/v1/responses \
+  -H "Authorization: Bearer $ZAKO_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"YOUR_REQUEST_MODEL_ID","input":"Hello"}'
+
+# 流式请求
+curl -N http://localhost:1990/v1/responses \
+  -H "Authorization: Bearer $ZAKO_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"YOUR_REQUEST_MODEL_ID","input":"Hello","stream":true}'
+```
+
+`YOUR_REQUEST_MODEL_ID` 可以是**已勾选的实际模型名**，也可以是**账号配置的请求模型别名**。
+
+**常用客户端的填法**：
+
+| 客户端 | Base URL 填什么 | API Key 填什么 | 模型填什么 |
+| --- | --- | --- | --- |
+| Cline / Roo Code | `http://localhost:1990/v1` | 你在密钥管理里生成的 key | 实际模型名或别名 |
+| Claude Code（Anthropic 协议） | `http://localhost:1990` | 同上 | 已勾选的模型名 |
+| 自己的脚本 | `http://localhost:1990/v1` | 同上 | 同上 |
+
+### 4.6 配置顺序（照这个顺序做）
+
+1. **账号管理** → 添加上游端点 + API Key → 勾选协议 → 拉取模型并勾选 → 选所属分组 → 设优先级 → 保存
+2. **分组管理** → 建分组 → 在「破甲策略」里用 `profile_ids` 勾选专用策略 →（可选）开 `default_strategy_enabled`
+3. **密钥管理** → 为分组创建命名密钥 → **复制保存**（之后登录控制台还能再复制）
+4. **系统设置** → 配安全入口、超时、冷却时间、统计保留天数 → 保存
+5. **客户端** → 填 Base URL、API Key、模型名
+
+### 4.7 本地开发
+
+需要 Rust **1.99**、Node.js **22** 及 npm（SQLite 在 Rust 构建中自带）：
+
+```sh
+cd web
+npm ci
+npm run build
+cd ..
+cargo run --locked
+```
+
+本地默认监听 `0.0.0.0:1990`，用 `DATA_DIR=data`、`WEB_DIR=web/dist`。
+仅本机访问时设置 `BIND_ADDR=127.0.0.1:1990`。
+`RUST_LOG` 控制日志级别。
+
+### 4.8 CI 检查（本地也能跑）
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
+```
+
+GitHub Actions 包含四项检查：**Rust Quality**（格式 + 严格 Clippy）、**Backend Tests**（单元测试 + 模拟上游集成测试）、**Frontend**（全新依赖安装 + TypeScript + 生产构建）、**Docker**（Compose 验证 + 镜像构建 + 非 root HTTP 冒烟 + 重启后的初始化持久化）。Docker 在前三项通过后执行，再于默认分支推送时发布镜像。
+
+> CI 使用**临时生成的测试账密，不使用真实上游密钥**。
+
+---
+
+## 五、常见问题 / 注意事项
+
+### 坑 1：429 到底是谁限的？
+
+两种 429，**含义完全不同**：
+
+| 情况 | HTTP 状态 | 错误 `code` | `Retry-After` |
+| --- | --- | --- | --- |
+| **本地 RPM 超限** | 429 | `rate_limit_exceeded` | 当前分钟剩余秒数 |
+| **本地并发超限** | 429 | `concurrency_limit_exceeded` | 建议 1 秒 |
+| **账号故障冷却中** | **503** | `upstream_cooldown` | 剩余冷却秒数 |
+
+**关键区别**：本地限流返回 **429**，账号冷却返回 **503**。**上游的 HTTP 状态不会被改写** —— 真实上游错误标为 `upstream`，保留原状态、脱敏正文和 `Retry-After`。
+
+本地调度错误带 `x-zako-error-source: local` 和请求 ID。
+
+### 坑 2：策略注入让 token 消耗暴涨
+
+**原因**：冷咖啡系列策略单次匹配就注入 **64–66 KB** 的文本。
+
+**解法**：
+- 分组里**不勾**对应模型的专用策略
+- 或把 `default_strategy_enabled` **关掉**（默认就是关的）
+- 在系统设置里适当调大超时（注入后请求会更长）
+
+### 坑 3：改完密码，所有会话都被踢了
+
+这是**设计如此**：修改密码需要验证原密码并再次确认新密码，**成功后撤销所有会话**。
+
+> ⚠️ 原文特别说明：此处二次确认**不是 TOTP 等独立第二认证因素**。
+
+### 坑 4：Docker 里 `127.0.0.1` 指容器自己
+
+配置账号代理时，如果代理跑在宿主机上，填 `127.0.0.1` 会指向容器自身。**填容器可访问的地址**，比如 `host.docker.internal:7897`（Docker Desktop）或宿主机的局域网 IP。
+
+### 坑 5：备份一定要带上 `master.key`
+
+```
+/data/
+├── zako.db        ← SQLite 数据库
+└── master.key     ← ⚠️ 主密钥
+```
+
+- **缺了匹配的 `master.key`，数据库里的 API key 解不开**
+- 数据库、SQLite 附属文件和 `master.key` **必须来自同一次备份**
+- 停机备份（能拿到一致快照）：
+
+```sh
+docker compose stop
+docker compose cp proxy:/data ./zako-backup
+docker compose start
+```
+
+恢复时把备份内容放回数据卷 `/data` 根目录，**保留 `10001:10001` 所有权**。恢复后检查 `/health`、管理员登录和一次小型上游请求。
+**请勿将备份提交到 Git。**
+
+### 坑 6：更新器权限很大，要小心
+
+`updater` 服务持有 **Docker socket**，能力近似宿主机 root。
+
+- 只挂载给更新器，**不挂载给公开的 proxy 服务**
+- 不要对外暴露内部接口或共享令牌
+- **仅在受控服务器上部署**
+
+### 坑 7：仓库改名后旧版更新器会失灵
+
+v0.5.0 及更早版本的更新器**严格匹配旧 Release URL**，仓库改名后网页检查或更新会失败。
+
+**解法**（在原部署目录执行，**同时替换 proxy 和 updater**，保持原目录、Compose 项目名和数据卷不变）：
+
+```sh
+git remote set-url origin https://github.com/mizaawa/ZakoProxyCLI.git
+git pull --ff-only origin main
+docker compose build --pull
+docker compose up -d --no-build
+docker compose ps
+```
+
+### 坑 8：流式响应中断了会重放吗？
+
+**不会。** 流式响应已开始后中断**不会重放请求** —— 已经吐出去的内容收不回来。
+
+但工具调用和流结束的处理是精细的：
+- Responses 的 `response.completed`、Anthropic 的 `message_stop`、Chat 的 `[DONE]` 或全部 `choices` 的非空 `finish_reason` → **释放账号并发槽**，后续工具结果可立即续接
+- Chat 中转在完整 `finish_reason` 后正常 EOF、未发 `[DONE]` → 也视为正常结束
+- **仅部分 choice 结束或没有完成标志 → 仍按截断处理**
+- Responses 因 `max_output_tokens` / `content_filter` 正常停止 → **不会**累积账号故障
+
+### 坑 9：统计口径
+
+- **缓存 token 已包含在输入 token 内**，总 token = 输入 + 输出，**不重复计数**
+- 用量来自上游 JSON 或完成后的 SSE 用量字段，**缺失时计为零，不估算**
+- RPM / TPM 是**最近 60 秒**已结束并记录的请求
+- 每日统计用 **UTC**
+- 总量和单密钥用量基于**保留中的请求元数据**，**并非永久计费账本**，默认保留 **90 天**
+- **Cyber 计数**表示响应中出现不区分大小写的 `cyber` 文本，每个响应**最多计一次**。这是**文本启发式统计，不等同于特定弹窗、拒答或模型行为的检测结果**
+
+### 坑 10：Turnstile 密钥在哪改？
+
+v0.9.3 起，Turnstile 站点密钥和密钥**统一保存在项目根目录 `.env`**。系统设置保存时会**自动更新该文件**，旧数据库里的 Turnstile 配置会被清理。
+
+启用 Turnstile **两个密钥都必须填**。系统设置页提供后台连接测试和右上角 Toast 提示。
+
+### 坑 11：日志里没有提示词和响应正文
+
+这是**有意为之**：请求日志**不持久化提示词或响应正文**。SQLite 文件和其他元数据**未进行整盘加密**。
+
+---
+
+## 六、目录结构速览
+
+```
+ZakoProxyCLI/            （本地目录名恰好是 "-"，是 GitHub 上游名 ZakoProxyCLI）
+├── src/                   ← Rust 后端
+│   ├── main.rs              程序入口
+│   ├── lib.rs               模块声明
+│   ├── api.rs               REST API（管理端 /api/*）
+│   ├── proxy.rs             转发核心（Responses / Chat / Anthropic 三条链路）
+│   ├── network.rs           网络层（重试、超时、代理）
+│   ├── store.rs             SQLite 持久化
+│   ├── profiles.rs          策略加载与匹配
+│   ├── update.rs            更新检查
+│   └── bin/
+│       └── zakoai-updater.rs  独立的更新器二进制（Compose 里是单独服务）
+├── web/                   ← 前端（React + Vite）
+│   ├── src/
+│   │   ├── Dashboard.tsx       仪表盘
+│   │   ├── Management.tsx      账号/分组/密钥管理
+│   │   ├── RequestLogs.tsx     调用日志
+│   │   ├── Settings.tsx        系统设置
+│   │   ├── SystemUpdates.tsx   更新界面
+│   │   ├── useUpdateCheck.ts   版本检查 hook
+│   │   └── api.ts              API 客户端
+│   ├── package.json
+│   └── vite.config.ts
+├── profiles/              ← 破甲策略目录
+│   ├── index.json            策略清单（36 个策略 / 37 个精确模型 ID）
+│   ├── default.md            默认策略正文（3,844 字节）
+│   ├── default.SOURCE.json   默认策略来源记录
+│   ├── colcoffee/            冷咖啡系列（含 SOURCE.json）
+│   ├── hanshuang/            寒霜系列（含 SOURCE.json）
+│   ├── dsh-purge/            DeepSeek 兼容策略（含 SOURCE.json）
+│   └── kimi-break/           Kimi 系列（含 SOURCE.json）
+├── third_party/           ← 第三方许可与改编声明
+│   ├── gpt-instruct.LICENSE
+│   ├── colcoffee.LICENSE
+│   ├── hanshuang/            （NOTICE.md + 必要选段）
+│   └── kimi-break/
+├── scripts/               ← 策略导入与校验脚本
+│   ├── import-coldcoffee.py    从上游干净副本重新生成冷咖啡策略
+│   ├── import-hanshuang.py     寒霜策略导入（--check 可离线核验）
+│   ├── import-kimi-break.py    Kimi 策略导入
+│   ├── import-profiles.ps1
+│   ├── check-release-version.py
+│   └── test_release_version.py
+├── tests/                 ← Rust 集成测试
+│   ├── application.rs
+│   ├── chat_completions.rs
+│   ├── anthropic.rs
+│   ├── multi_model.rs
+│   ├── default_strategy.rs
+│   ├── kimi_profiles.rs
+│   ├── request_logs.rs
+│   ├── account_proxy.rs
+│   └── tool_stream_lifecycle.rs
+├── compose.yaml           ← Docker Compose（proxy + updater 两个服务）
+├── Dockerfile             ← 多阶段构建（runtime / updater 两个 target）
+├── Cargo.toml / Cargo.lock ← Rust 依赖（axum / tokio / rusqlite / aes-gcm / argon2…）
+├── .env                   ← 运行时配置（不进 Git）
+├── .env.example           ← 配置模板
+├── API_CONTRACT.md        ← 完整的控制台 API 契约
+├── SECURITY.md            ← 安全说明
+├── README.md              ← 中文（默认首页，你正在看的）
+├── README.en.md           ← 英文版
+├── README.zh-CN.md        ← 中文文档入口（指向 README.md）
+└── LICENSE (MIT)
+```
+
+### 关键文件一句话解释
+
+| 文件/目录 | 一句话说明 |
+| --- | --- |
+| `src/proxy.rs` | 转发核心 —— 三条协议链路、策略注入、SSE 透传都在这 |
+| `src/api.rs` | 管理端 REST API，具体契约看 `API_CONTRACT.md` |
+| `src/store.rs` | SQLite 读写，密钥加密也在这一层 |
+| `src/profiles.rs` | 策略匹配逻辑（精确模型 ID 匹配 + 专用优先 + 默认兜底） |
+| `profiles/index.json` | 策略清单，改这里 = 改哪些模型会注入什么 |
+| `profiles/*/SOURCE.json` | 每个策略的**来源、哈希、选段范围**记录 —— 保证可复现 |
+| `src/bin/zakoai-updater.rs` | 独立更新器，只有它有 Docker socket |
+| `compose.yaml` | 两个服务：`proxy`（公开）+ `updater`（隔离，不发布端口） |
+| `scripts/import-*.py` | 策略导入器，**只读数据，不执行安装器或 Skill** |
+| `API_CONTRACT.md` | 想对接控制台 API就看这份，写得很细（含 `X-Console-Path` 约定） |
+
+---
+
+## 七、本仓库说明
+
+| 项目 | 说明 |
+| --- | --- |
+| **本仓库** | `aiwozhonghua81/-` —— 一个 **fork（派生仓库）**。**仓库名就是一个连字符 `-`**，这是 GitHub 上游的实际名字（`mizaawa/ZakoProxyCLI`）在本账号下的映射 |
+| **上游项目** | **ZakoAI Proxy（ZakoProxyCLI）** |
+| **上游地址** | https://github.com/mizaawa/ZakoProxyCLI |
+| **镜像** | `ghcr.io/mizaawa/zakoai-proxy-cli:latest`（默认分支 CI 成功后会发布该镜像及对应提交 SHA 标签） |
+| **技术栈** | Rust（axum + tokio + rusqlite）+ React/Vite 前端 |
+| **端口** | 默认 `127.0.0.1:1990` |
+| **许可证** | **MIT** |
+| **本仓库改动** | 仅在 README 顶部新增本中文说明区块；**未修改任何源码文件** |
+
+### ⚠️ 关于目录名是 `-` 这件事
+
+本地克隆出来的目录名就是一个连字符 `-`，这在 bash 里有点危险：
+
+```bash
+# ❌ 错误：这会被 bash 解释成「回到上一个目录」
+cd -
+
+# ✅ 正确：用绝对路径
+cd /c/Users/aiwoz/WorkBuddy/2026-11-11-12-18-54/github-projects/-
+
+# ✅ 更稳：用 git -C
+git -C "/c/Users/aiwoz/WorkBuddy/2026-11-11-12-18-54/github-projects/-" status
+```
+
+### README 的结构
+
+```
+┌─────────────────────────────────────────────┐
+│  👆 本节：中文详细说明（面向普通读者）        │  ← 本次新增
+├─────────────────────────────────────────────┤
+│  👇 下方：上游 README 原文（未删改）           │  ← 上游 mizaawa 撰写
+└─────────────────────────────────────────────┘
+```
+
+- 上游 README 共 **245 行**，本身就是中文，内容包括：免责声明、AI中转站推广链接、Docker Compose 部署、网页更新说明、各版本更新日志（v0.5.0 到 v0.9.3）、四大配置模块详解（分组/账号/密钥/系统设置）、36 个策略的模型表、客户端 API 说明、统计与存储、备份恢复、本地开发与 CI、以及**完整的第三方许可声明**。**这些内容全部保留在下方。**
+- 另有 [`README.en.md`](README.en.md)（英文版，210 行）也一并保留。
+- 本中文区块的**增量价值**在于：把账号调度规则（优先级、重试次数、哪些状态码会切换）、策略匹配的完整规则、429 vs 503 的区别、加密与备份细节这些**散落在原文各处的规则集中梳理成了一张速查表**，并补充了 11 条实际会踩的坑。
+
+---
+
+## 📌 快速自查清单
+
+上线前对一遍：
+
+- [ ] 管理员密码已设置（**至少 12 个字符**），不是默认值
+- [ ] 安全入口路径已改（不是 `/`）
+- [ ] `ZAKO_BIND_IP` 没设成 `0.0.0.0` 裸奔公网（要走反代 + HTTPS）
+- [ ] `TRUST_PROXY=1` **只**在可信反代之后设置
+- [ ] 反代关了 SSE 缓冲，读超时 > 系统设置里的请求超时
+- [ ] 策略注入的 token 开销你知道了（单次可能 +64KB）
+- [ ] `master.key` 和 `zako.db` 一起备份了
+- [ ] `updater` 没对外暴露端口
+- [ ] 上游 API Key 都是你自己的、来源合法
+
+---
+
+<!-- 中文说明结束 -->
+
+---
+
+↓ **上游 README 原文开始**（以下内容来自 [mizaawa/ZakoProxyCLI](https://github.com/mizaawa/ZakoProxyCLI)，未做任何删改） ↓
+
 # ZakoAI Proxy
 
 简体中文 · [English](README.en.md) · [安全说明](SECURITY.md) · [API 契约](API_CONTRACT.md)
